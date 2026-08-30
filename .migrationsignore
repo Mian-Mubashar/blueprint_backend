@@ -1,0 +1,4 @@
+# Migration files to ignore
+# This file is for reference only
+# All migrations should be in server/migrations/ directory
+

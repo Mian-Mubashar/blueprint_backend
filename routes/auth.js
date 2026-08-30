@@ -1,10 +1,12 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
 const { body, validationResult } = require('express-validator');
 const { OAuth2Client } = require('google-auth-library');
 const pool = require('../config/database');
 const auth = require('../middleware/auth');
+const sendEmail = require('../utils/email');
 
 const router = express.Router();
 
@@ -14,14 +16,23 @@ router.post('/register', [
   body('password').isLength({ min: 6 }),
   body('firstName').notEmpty().trim(),
   body('lastName').notEmpty().trim(),
-  body('phone').isMobilePhone('any'),
-  body('dateOfBirth').isISO8601().toDate()
+  body('phone').notEmpty().trim(),
+  body('dateOfBirth').notEmpty()
 ], async (req, res) => {
   try {
+    console.log('Registration attempt:', {
+      email: req.body.email,
+      firstName: req.body.firstName,
+      lastName: req.body.lastName,
+      phone: req.body.phone
+    });
+
     const errors = validationResult(req);
     if (!errors.isEmpty()) {
+      const errorDetails = errors.array().map(e => `${e.path || e.param}: ${e.msg}`).join(', ');
+      console.error('Validation errors:', errors.array());
       return res.status(400).json({
-        message: 'Validation failed',
+        message: `Validation failed: ${errorDetails}`,
         errors: errors.array()
       });
     }
@@ -48,48 +59,64 @@ router.post('/register', [
     } = req.body;
 
     // Check if user already exists
+    console.log('Checking for existing user...');
     const [existingUsers] = await pool.execute(
       'SELECT id FROM users WHERE email = ? OR phone = ?',
       [email, phone]
     );
 
     if (existingUsers.length > 0) {
+      console.error('User already exists:', { email, phone });
       return res.status(400).json({
         message: 'User with this email or phone number already exists'
       });
     }
 
     // Hash password
+    console.log('Hashing password...');
     const saltRounds = 12;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    // Insert new user
+    // Insert new user (default role = user)
+    console.log('Inserting user into database...');
     const [result] = await pool.execute(
       `INSERT INTO users (
         email, password, first_name, last_name, phone, date_of_birth,
         address, city, state, bvn, bank_account_number, bank_name, account_name,
-        employment_status, monthly_income, employer_name, job_title, employment_duration
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        employment_status, monthly_income, employer_name, job_title, employment_duration, role
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         email, hashedPassword, firstName, lastName, phone, dateOfBirth,
-        address, city, state, bvn, bankAccountNumber, bankName, accountName,
-        employmentStatus, monthlyIncome, employerName, jobTitle, employmentDuration
+        address || null, city || null, state || null,
+        bvn || null,
+        bankAccountNumber || null,
+        bankName || null,
+        accountName || null,
+        employmentStatus || null,
+        monthlyIncome ? parseFloat(monthlyIncome) : null,
+        employerName || null,
+        jobTitle || null,
+        employmentDuration ? parseInt(employmentDuration) : null,
+        'user'
       ]
     );
 
+    console.log('User inserted successfully, ID:', result.insertId);
+
     // Generate JWT token
     const token = jwt.sign(
-      { userId: result.insertId, email },
+      { userId: result.insertId, email, role: 'user' },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '7d' }
     );
 
     // Get user data (excluding password)
     const [newUser] = await pool.execute(
-      'SELECT id, email, first_name, last_name, phone, is_verified, created_at FROM users WHERE id = ?',
+      'SELECT id, email, first_name, last_name, phone, role, is_verified, created_at FROM users WHERE id = ?',
       [result.insertId]
     );
 
+    console.log('Registration successful for:', email);
     res.status(201).json({
       message: 'User registered successfully',
       token,
@@ -97,10 +124,42 @@ router.post('/register', [
     });
 
   } catch (error) {
-    console.error('Registration error:', error);
+    console.error('Registration error:', {
+      message: error.message,
+      code: error.code,
+      sqlMessage: error.sqlMessage,
+      sqlState: error.sqlState,
+      stack: error.stack
+    });
+
+    // More specific error messages
+    let errorMessage = 'Registration failed';
+    if (error.code === 'ER_DUP_ENTRY') {
+      errorMessage = 'Email or phone number already exists';
+    } else if (error.code === 'ER_NO_SUCH_TABLE') {
+      errorMessage = 'Database table not found. Please run migrations first.';
+    } else if (error.code === 'ECONNREFUSED' || error.code === 'ETIMEDOUT') {
+      errorMessage = 'Database connection failed. Please check your database settings.';
+    } else if (error.sqlMessage) {
+      errorMessage = `Database error: ${error.sqlMessage}`;
+    } else {
+      errorMessage = error.message || 'Registration failed';
+    }
+
+    const fs = require('fs');
+    try {
+      fs.writeFileSync('debug_error.log', JSON.stringify({
+        message: error.message,
+        code: error.code,
+        sqlMessage: error.sqlMessage,
+        sqlState: error.sqlState,
+        stack: error.stack
+      }, null, 2));
+    } catch (e) { }
+
     res.status(500).json({
-      message: 'Registration failed',
-      error: error.message
+      message: errorMessage,
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
     });
   }
 });
@@ -143,15 +202,23 @@ router.post('/login', [
       });
     }
 
+    // Ensure role exists (default to 'user' if not set)
+    const userRole = user.role || 'user';
+
     // Generate JWT token
     const token = jwt.sign(
-      { userId: user.id, email: user.email },
+      { userId: user.id, email: user.email, role: userRole },
       process.env.JWT_SECRET || 'your-secret-key',
       { expiresIn: '7d' }
     );
 
     // Return user data (excluding password)
     const { password: _, ...userWithoutPassword } = user;
+    
+    // Ensure role is set in response
+    if (!userWithoutPassword.role) {
+      userWithoutPassword.role = 'user';
+    }
 
     res.json({
       message: 'Login successful',
@@ -160,10 +227,15 @@ router.post('/login', [
     });
 
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('Login error:', {
+      message: error.message,
+      code: error.code,
+      sqlMessage: error.sqlMessage,
+      stack: error.stack
+    });
     res.status(500).json({
       message: 'Login failed',
-      error: error.message
+      error: process.env.NODE_ENV === 'development' ? error.message : 'Internal server error'
     });
   }
 });
@@ -172,7 +244,7 @@ router.post('/login', [
 router.get('/me', auth, async (req, res) => {
   try {
     const [users] = await pool.execute(
-      'SELECT id, email, first_name, last_name, phone, date_of_birth, address, city, state, bvn, bank_account_number, bank_name, account_name, employment_status, monthly_income, employer_name, job_title, employment_duration, is_verified, created_at FROM users WHERE id = ?',
+      'SELECT id, email, first_name, last_name, phone, date_of_birth, address, city, state, bvn, bank_account_number, bank_name, account_name, employment_status, monthly_income, employer_name, job_title, employment_duration, is_verified, role, created_at FROM users WHERE id = ?',
       [req.user.userId]
     );
 
@@ -199,7 +271,7 @@ router.get('/me', auth, async (req, res) => {
 router.put('/profile', auth, [
   body('firstName').optional().notEmpty().trim(),
   body('lastName').optional().notEmpty().trim(),
-  body('phone').optional().isMobilePhone('any'),
+  body('phone').optional().notEmpty().trim(),
   body('email').optional().isEmail().normalizeEmail()
 ], async (req, res) => {
   try {
@@ -457,6 +529,294 @@ router.post('/google-login', [
     console.error('Google login error:', error);
     res.status(500).json({
       message: 'Google login failed',
+      error: error.message
+    });
+  }
+});
+
+// Forgot password - send reset link
+router.post('/forgot-password', [
+  body('email').isEmail().withMessage('Please provide a valid email address')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    // Get email from request body and trim it (don't normalize to preserve user's exact email)
+    const email = req.body.email ? req.body.email.trim().toLowerCase() : '';
+    
+    console.log('=== FORGOT PASSWORD REQUEST ===');
+    console.log('Email from request body (original):', req.body.email);
+    console.log('Email after trim/lowercase:', email);
+
+    // Try multiple query approaches to find user
+    let users = [];
+    
+    // First try: Case-insensitive search with LOWER()
+    try {
+      [users] = await pool.execute(
+        'SELECT id, email, first_name, last_name FROM users WHERE LOWER(email) = ?',
+        [email]
+      );
+      console.log('Query 1 (LOWER): Found', users.length, 'users');
+    } catch (err) {
+      console.error('Query 1 error:', err.message);
+    }
+    
+    // Second try: Direct email match (in case LOWER() doesn't work)
+    if (users.length === 0) {
+      try {
+        [users] = await pool.execute(
+          'SELECT id, email, first_name, last_name FROM users WHERE email = ?',
+          [email]
+        );
+        console.log('Query 2 (direct): Found', users.length, 'users');
+      } catch (err) {
+        console.error('Query 2 error:', err.message);
+      }
+    }
+    
+    // Third try: Case-insensitive with LIKE (for partial matches)
+    if (users.length === 0) {
+      try {
+        [users] = await pool.execute(
+          'SELECT id, email, first_name, last_name FROM users WHERE email LIKE ?',
+          [`%${email.split('@')[0]}%@%`]
+        );
+        console.log('Query 3 (LIKE): Found', users.length, 'users');
+        if (users.length > 0) {
+          console.log('Found similar emails:', users.map(u => u.email));
+          // Filter to exact match (case-insensitive)
+          users = users.filter(u => u.email.toLowerCase() === email);
+          console.log('After filtering:', users.length, 'exact matches');
+        }
+      } catch (err) {
+        console.error('Query 3 error:', err.message);
+      }
+    }
+    
+    // Debug: Show all emails in database (for debugging only)
+    if (users.length === 0 && process.env.NODE_ENV === 'development') {
+      try {
+        const [allUsers] = await pool.execute(
+          'SELECT email FROM users LIMIT 10'
+        );
+        console.log('Sample emails in database:', allUsers.map(u => u.email));
+      } catch (err) {
+        console.error('Debug query error:', err.message);
+      }
+    }
+    
+    console.log('User found:', users.length > 0 ? 'Yes' : 'No');
+    if (users.length > 0) {
+      console.log('User email in database:', users[0].email);
+      console.log('User ID:', users[0].id);
+    } else {
+      console.log('No user found with email:', email);
+    }
+
+    // Always return success to prevent email enumeration
+    if (users.length === 0) {
+      return res.json({
+        message: 'If an account with that email exists, we have sent a password reset link.'
+      });
+    }
+
+    const user = users[0];
+
+    // Generate reset token
+    const resetToken = crypto.randomBytes(32).toString('hex');
+    const hashedToken = crypto.createHash('sha256').update(resetToken).digest('hex');
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + 1); // Token expires in 1 hour
+
+    try {
+      // Check if table exists, if not create it
+      try {
+        await pool.execute('SELECT 1 FROM password_reset_tokens LIMIT 1');
+      } catch (tableError) {
+        if (tableError.code === 'ER_NO_SUCH_TABLE') {
+          console.log('Creating password_reset_tokens table...');
+          await pool.execute(`
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+              id INT PRIMARY KEY AUTO_INCREMENT,
+              user_id INT NOT NULL,
+              token VARCHAR(255) NOT NULL UNIQUE,
+              expires_at TIMESTAMP NOT NULL,
+              used BOOLEAN DEFAULT FALSE,
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+              FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+              INDEX idx_token (token),
+              INDEX idx_user_id (user_id),
+              INDEX idx_expires_at (expires_at)
+            )
+          `);
+          console.log('password_reset_tokens table created successfully');
+        } else {
+          throw tableError;
+        }
+      }
+
+      // Delete any existing reset tokens for this user
+      await pool.execute(
+        'DELETE FROM password_reset_tokens WHERE user_id = ?',
+        [user.id]
+      );
+
+      // Save reset token to database
+      await pool.execute(
+        `INSERT INTO password_reset_tokens (user_id, token, expires_at) 
+         VALUES (?, ?, ?)`,
+        [user.id, hashedToken, expiresAt]
+      );
+
+      // Create reset URL
+      const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password?token=${resetToken}&email=${encodeURIComponent(email)}`;
+
+      // Send email
+      try {
+        console.log('=== SENDING PASSWORD RESET EMAIL ===');
+        console.log('User email from request (normalized):', email);
+        console.log('User email from database:', user.email);
+        console.log('User ID:', user.id);
+        console.log('User name:', user.first_name);
+        
+        // Use the email from database (user's actual registered email) to send reset link
+        // This ensures we send to the exact email they registered with
+        let emailToSend = user.email ? user.email.trim() : '';
+        
+        // CRITICAL: Validate email before sending
+        if (!emailToSend) {
+          throw new Error('User email is empty in database');
+        }
+        
+        if (!emailToSend.includes('@')) {
+          throw new Error(`Invalid user email format in database: ${emailToSend}`);
+        }
+        
+        // CRITICAL: Ensure we're NOT sending to admin email
+        if (emailToSend.toLowerCase() === 'mubasharhanif24@gmail.com') {
+          console.error('ERROR: User email matches admin email! This should not happen.');
+          console.error('   User ID:', user.id);
+          console.error('   User email in DB:', user.email);
+          throw new Error('Cannot send password reset to admin email. User must have their own email.');
+        }
+        
+        // Send email with explicit email address - NO HARDCODED VALUES
+        const emailResult = await sendEmail({
+          to: emailToSend, // CRITICAL: Use user's registered email from database - NO HARDCODED EMAIL
+          subject: 'Reset Your Password - Blue Print Financial',
+          template: 'password-reset',
+          data: {
+            name: user.first_name,
+            resetUrl,
+            expiresIn: '1 hour'
+          }
+        });
+      } catch (emailError) {
+        console.error('Failed to send password reset email:', emailError);
+        console.error('Email error details:', {
+          message: emailError.message,
+          stack: emailError.stack,
+          to: email
+        });
+        // Still return success to prevent email enumeration
+        // In development, log the reset URL
+        if (process.env.NODE_ENV === 'development') {
+          console.log('🔗 Password Reset URL (dev only):', resetUrl);
+        }
+      }
+
+      res.json({
+        message: 'If an account with that email exists, we have sent a password reset link.'
+      });
+
+    } catch (dbError) {
+      console.error('Database error in forgot password:', dbError);
+      // If it's a table error, provide helpful message
+      if (dbError.code === 'ER_NO_SUCH_TABLE') {
+        return res.status(500).json({
+          message: 'Database table not found. Please run migrations: npm run migrate'
+        });
+      }
+      throw dbError;
+    }
+
+  } catch (error) {
+    console.error('Forgot password error:', error);
+    res.status(500).json({
+      message: 'Failed to process password reset request',
+      error: process.env.NODE_ENV === 'development' ? error.message : undefined
+    });
+  }
+});
+
+// Reset password with token
+router.post('/reset-password', [
+  body('token').notEmpty(),
+  body('email').isEmail().normalizeEmail(),
+  body('password').isLength({ min: 6 })
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { token, email, password } = req.body;
+
+    // Hash the token to compare with database
+    const hashedToken = crypto.createHash('sha256').update(token).digest('hex');
+
+    // Find user and valid token
+    const [tokens] = await pool.execute(
+      `SELECT prt.*, u.id as user_id, u.email 
+       FROM password_reset_tokens prt
+       JOIN users u ON prt.user_id = u.id
+       WHERE prt.token = ? AND u.email = ? AND prt.used = FALSE AND prt.expires_at > NOW()`,
+      [hashedToken, email]
+    );
+
+    if (tokens.length === 0) {
+      return res.status(400).json({
+        message: 'Invalid or expired reset token'
+      });
+    }
+
+    const resetToken = tokens[0];
+
+    // Hash new password
+    const saltRounds = 12;
+    const hashedPassword = await bcrypt.hash(password, saltRounds);
+
+    // Update user password
+    await pool.execute(
+      'UPDATE users SET password = ? WHERE id = ?',
+      [hashedPassword, resetToken.user_id]
+    );
+
+    // Mark token as used
+    await pool.execute(
+      'UPDATE password_reset_tokens SET used = TRUE WHERE id = ?',
+      [resetToken.id]
+    );
+
+    res.json({
+      message: 'Password reset successfully. You can now login with your new password.'
+    });
+
+  } catch (error) {
+    console.error('Reset password error:', error);
+    res.status(500).json({
+      message: 'Failed to reset password',
       error: error.message
     });
   }

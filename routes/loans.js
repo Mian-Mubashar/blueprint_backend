@@ -70,9 +70,12 @@ router.get('/:id', auth, async (req, res) => {
 // Create new loan application
 router.post('/apply', auth, [
   body('loanType').isIn(['small_business', 'payday', 'collateral']),
-  body('amountRequested').isFloat({ min: 10000, max: 50000000 }),
+  body('amountRequested').isFloat({ min: 1, max: 50000000 }),
   body('loanDuration').isInt({ min: 1, max: 60 }),
-  body('purpose').notEmpty().trim()
+  body('purpose').notEmpty().trim(),
+  body('bankName').notEmpty().trim(),
+  body('accountNumber').notEmpty().trim(),
+  body('accountName').notEmpty().trim()
 ], async (req, res) => {
   try {
     const errors = validationResult(req);
@@ -88,10 +91,36 @@ router.post('/apply', auth, [
       amountRequested,
       loanDuration,
       purpose,
+      bankName,
+      accountNumber,
+      accountName,
       collateralDetails,
       businessDetails,
       applicationDocuments
     } = req.body;
+
+    // Minimum amounts for each loan type
+    const minAmounts = {
+      small_business: 5000,
+      payday: 8000,
+      collateral: 20000
+    };
+
+    const minAmount = minAmounts[loanType] || 5000;
+    const numericAmount = parseFloat(amountRequested);
+
+    if (numericAmount < minAmount) {
+      return res.status(400).json({
+        message: `Minimum amount for ${loanType.replace('_', ' ')} loan is ₦${minAmount.toLocaleString()}`,
+        errors: [{ msg: `Amount must be at least ₦${minAmount.toLocaleString()}` }]
+      });
+    }
+
+    // Update user's bank details
+    await pool.execute(
+      'UPDATE users SET bank_name = ?, bank_account_number = ?, account_name = ? WHERE id = ?',
+      [bankName, accountNumber, accountName, req.user.userId]
+    );
 
     // Get system settings for interest rates
     const [settings] = await pool.execute(
@@ -103,8 +132,8 @@ router.post('/apply', auth, [
 
     // Calculate monthly repayment (simple interest calculation)
     const monthlyInterestRate = interestRate / 100 / 12;
-    const monthlyRepayment = (amountRequested * monthlyInterestRate * Math.pow(1 + monthlyInterestRate, loanDuration)) / 
-                           (Math.pow(1 + monthlyInterestRate, loanDuration) - 1);
+    const monthlyRepayment = (amountRequested * monthlyInterestRate * Math.pow(1 + monthlyInterestRate, loanDuration)) /
+      (Math.pow(1 + monthlyInterestRate, loanDuration) - 1);
 
     // Insert loan application
     const [result] = await pool.execute(
@@ -154,7 +183,7 @@ router.post('/apply', auth, [
 // Update loan application
 router.put('/:id', auth, [
   body('loanType').optional().isIn(['small_business', 'payday', 'collateral']),
-  body('amountRequested').optional().isFloat({ min: 10000, max: 50000000 }),
+  body('amountRequested').optional().isFloat({ min: 1, max: 50000000 }),
   body('loanDuration').optional().isInt({ min: 1, max: 60 }),
   body('purpose').optional().notEmpty().trim()
 ], async (req, res) => {
@@ -177,6 +206,28 @@ router.put('/:id', auth, [
       businessDetails,
       applicationDocuments
     } = req.body;
+
+    // Minimum amounts for each loan type
+    const minAmounts = {
+      small_business: 5000,
+      payday: 8000,
+      collateral: 20000
+    };
+
+    // Validate minimum amount if amountRequested is provided
+    if (amountRequested) {
+      const loanTypeForValidation = loanType || (await pool.execute('SELECT loan_type FROM loan_applications WHERE id = ?', [id]))[0]?.[0]?.loan_type;
+      if (loanTypeForValidation) {
+        const minAmount = minAmounts[loanTypeForValidation] || 5000;
+        const numericAmount = parseFloat(amountRequested);
+        if (numericAmount < minAmount) {
+          return res.status(400).json({
+            message: `Minimum amount for ${loanTypeForValidation.replace('_', ' ')} loan is ₦${minAmount.toLocaleString()}`,
+            errors: [{ msg: `Amount must be at least ₦${minAmount.toLocaleString()}` }]
+          });
+        }
+      }
+    }
 
     // Check if application exists and belongs to user
     const [existingApplications] = await pool.execute(
@@ -280,6 +331,131 @@ router.put('/:id/cancel', auth, async (req, res) => {
   }
 });
 
+// Get repayment schedule for a loan
+router.get('/:id/repayment-schedule', auth, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Get loan details
+    const [loans] = await pool.execute(
+      `SELECT * FROM loan_applications WHERE id = ? AND user_id = ?`,
+      [id, req.user.userId]
+    );
+
+    if (loans.length === 0) {
+      return res.status(404).json({
+        message: 'Loan application not found'
+      });
+    }
+
+    const loan = loans[0];
+
+    // Only show schedule for approved or disbursed loans
+    if (!['approved', 'disbursed'].includes(loan.status)) {
+      return res.status(400).json({
+        message: 'Repayment schedule is only available for approved or disbursed loans'
+      });
+    }
+
+    // Calculate repayment schedule
+    const amount = parseFloat(loan.amount_requested);
+    const duration = loan.loan_duration;
+    const interestRate = parseFloat(loan.interest_rate || 0) / 100; // Convert to decimal
+    const monthlyRate = interestRate / 12;
+    
+    // Calculate monthly payment using amortization formula
+    let monthlyPayment = 0;
+    if (monthlyRate > 0) {
+      monthlyPayment = amount * (monthlyRate * Math.pow(1 + monthlyRate, duration)) / 
+                      (Math.pow(1 + monthlyRate, duration) - 1);
+    } else {
+      monthlyPayment = amount / duration;
+    }
+
+    // Generate schedule
+    const schedule = [];
+    let remainingBalance = amount;
+    const disbursedDate = loan.disbursed_at ? new Date(loan.disbursed_at) : new Date(loan.approved_at || loan.created_at);
+    
+    // Get all completed payments for this loan once (optimized - outside loop)
+    const [allPayments] = await pool.execute(
+      `SELECT * FROM payments 
+       WHERE loan_application_id = ? 
+       AND payment_type = 'loan_repayment' 
+       AND status = 'completed'
+       ORDER BY payment_date ASC`,
+      [loan.id]
+    );
+
+    for (let i = 0; i < duration; i++) {
+      const dueDate = new Date(disbursedDate);
+      dueDate.setMonth(dueDate.getMonth() + i + 1);
+      const dueDateStr = dueDate.toISOString().split('T')[0];
+      
+      let interest = 0;
+      let principal = 0;
+      
+      if (monthlyRate > 0) {
+        interest = remainingBalance * monthlyRate;
+        principal = monthlyPayment - interest;
+      } else {
+        principal = monthlyPayment;
+      }
+      
+      remainingBalance -= principal;
+      if (remainingBalance < 0.01) remainingBalance = 0;
+
+      // Match payment to installment based on payment order
+      // Payment number i+1 corresponds to installment i+1
+      let isPaid = false;
+      let paidDate = null;
+      
+      if (allPayments.length > i) {
+        // We have at least i+1 payments, so installment i+1 is paid
+        const paymentForThisInstallment = allPayments[i];
+        if (paymentForThisInstallment) {
+          isPaid = true;
+          paidDate = paymentForThisInstallment.payment_date;
+        }
+      }
+
+      schedule.push({
+        id: i + 1,
+        payment_number: i + 1,
+        due_date: dueDateStr,
+        amount: monthlyPayment.toFixed(2),
+        principal: principal.toFixed(2),
+        interest: interest.toFixed(2),
+        remaining_balance: remainingBalance.toFixed(2),
+        status: isPaid ? 'paid' : 'pending',
+        paid_date: paidDate
+      });
+    }
+
+    res.json({
+      loan: {
+        id: loan.id,
+        loan_type: loan.loan_type,
+        amount_requested: loan.amount_requested,
+        loan_duration: loan.loan_duration,
+        interest_rate: loan.interest_rate,
+        monthly_repayment: loan.monthly_repayment || monthlyPayment.toFixed(2),
+        status: loan.status,
+        disbursed_at: loan.disbursed_at,
+        approved_at: loan.approved_at
+      },
+      schedule
+    });
+
+  } catch (error) {
+    console.error('Get repayment schedule error:', error);
+    res.status(500).json({
+      message: 'Failed to get repayment schedule',
+      error: error.message
+    });
+  }
+});
+
 // Get loan calculator data
 router.get('/calculator/rates', async (req, res) => {
   try {
@@ -306,9 +482,17 @@ router.get('/calculator/rates', async (req, res) => {
       maxAmounts[loanType] = parseFloat(setting.setting_value);
     });
 
+    // Minimum amounts for each loan type
+    const minAmounts = {
+      small_business: 5000,
+      payday: 8000,
+      collateral: 20000
+    };
+
     res.json({
       interestRates: rates,
-      maxAmounts: maxAmounts
+      maxAmounts: maxAmounts,
+      minAmounts: minAmounts
     });
 
   } catch (error) {
@@ -322,7 +506,7 @@ router.get('/calculator/rates', async (req, res) => {
 
 // Calculate loan payment
 router.post('/calculator/calculate', [
-  body('amount').isFloat({ min: 10000 }),
+  body('amount').isFloat({ min: 1 }),
   body('duration').isInt({ min: 1, max: 60 }),
   body('loanType').isIn(['small_business', 'payday', 'collateral'])
 ], async (req, res) => {
@@ -337,6 +521,23 @@ router.post('/calculator/calculate', [
 
     const { amount, duration, loanType } = req.body;
 
+    // Minimum amounts for each loan type
+    const minAmounts = {
+      small_business: 5000,
+      payday: 8000,
+      collateral: 20000
+    };
+
+    const minAmount = minAmounts[loanType] || 5000;
+    const numericAmount = parseFloat(amount);
+
+    if (numericAmount < minAmount) {
+      return res.status(400).json({
+        message: `Minimum amount for ${loanType.replace('_', ' ')} loan is ₦${minAmount.toLocaleString()}`,
+        errors: [{ msg: `Amount must be at least ₦${minAmount.toLocaleString()}` }]
+      });
+    }
+
     // Get interest rate for loan type
     const [settings] = await pool.execute(
       'SELECT setting_value FROM system_settings WHERE setting_key = ?',
@@ -347,8 +548,8 @@ router.post('/calculator/calculate', [
 
     // Calculate monthly payment
     const monthlyInterestRate = interestRate / 100 / 12;
-    const monthlyPayment = (amount * monthlyInterestRate * Math.pow(1 + monthlyInterestRate, duration)) / 
-                          (Math.pow(1 + monthlyInterestRate, duration) - 1);
+    const monthlyPayment = (amount * monthlyInterestRate * Math.pow(1 + monthlyInterestRate, duration)) /
+      (Math.pow(1 + monthlyInterestRate, duration) - 1);
 
     const totalPayment = monthlyPayment * duration;
     const totalInterest = totalPayment - amount;

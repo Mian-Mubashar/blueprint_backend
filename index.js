@@ -1,3 +1,4 @@
+// Forced restart for nodemon
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -9,6 +10,7 @@ const loanRoutes = require('./routes/loans');
 const paymentRoutes = require('./routes/payments');
 const contactRoutes = require('./routes/contact');
 const userRoutes = require('./routes/users');
+const adminRoutes = require('./routes/admin');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
@@ -36,8 +38,8 @@ app.use(express.urlencoded({ extended: true }));
 
 // Health check endpoint
 app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'OK', 
+  res.status(200).json({
+    status: 'OK',
     message: 'Blue Print Financial API is running',
     timestamp: new Date().toISOString()
   });
@@ -49,6 +51,7 @@ app.use('/api/loans', loanRoutes);
 app.use('/api/payments', paymentRoutes);
 app.use('/api/contact', contactRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/admin', adminRoutes);
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -67,14 +70,23 @@ app.use('*', (req, res) => {
   });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Blue Print Financial server running on port ${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+// Start server (simple, fixed-port startup – nodemon handles restarts)
+app.listen(PORT, async () => {
+  console.log(`Blue Print Financial server running on port ${PORT}`);
+  console.log(`Health check: http://localhost:${PORT}/health`);
+  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Server started at: ${new Date().toISOString()}`);
+
+  // Test database connection on startup
+  try {
+    const pool = require('./config/database');
+    const [rows] = await pool.execute('SELECT 1 as test');
+    console.log('Database connection verified');
+    console.log('Run "npm run migrate" to apply database migrations');
+  } catch (error) {
+    console.error('Database connection failed on startup:', error.message);
+    console.error(' Please check your database configuration in .env file');
+  }
 });
 
 module.exports = app;
-
-
-

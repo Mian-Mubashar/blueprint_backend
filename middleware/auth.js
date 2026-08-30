@@ -13,9 +13,9 @@ const auth = async (req, res, next) => {
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
     
-    // Verify user still exists
+    // Verify user still exists and get role
     const [users] = await pool.execute(
-      'SELECT id, email, first_name, last_name FROM users WHERE id = ?',
+      'SELECT id, email, first_name, last_name, role FROM users WHERE id = ?',
       [decoded.userId]
     );
 
@@ -27,7 +27,8 @@ const auth = async (req, res, next) => {
 
     req.user = {
       userId: decoded.userId,
-      email: decoded.email
+      email: decoded.email,
+      role: users[0].role
     };
 
     next();
