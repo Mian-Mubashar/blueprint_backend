@@ -1,16 +1,9 @@
 const mysql = require('mysql2/promise');
 const fs = require('fs').promises;
 const path = require('path');
-require('dotenv').config();
+const { getDbConfig } = require('../config/dbConfig');
 
-const dbConfig = {
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'blueprint_financial',
-  port: process.env.DB_PORT || 3306,
-  multipleStatements: true
-};
+const dbConfig = getDbConfig({ multipleStatements: true });
 
 async function ensureMigrationsTable(connection) {
   // Create migrations table if it doesn't exist
