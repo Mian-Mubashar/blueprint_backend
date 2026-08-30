@@ -507,6 +507,7 @@ const sendEmail = async ({ to, subject, template, data, isAdminEmail = false }) 
       throw new Error('Cannot send email to hardcoded admin address. User email required.');
     }
 
+    
     // Build mail options - CRITICAL: Use the provided 'to' email, not any hardcoded value
     const mailOptions = {
       from: `"Blue Print Financial" <${process.env.EMAIL_USER || 'mubasharhanif24@gmail.com'}>`,
