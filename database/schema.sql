@@ -67,10 +67,12 @@ CREATE TABLE loan_applications (
 -- Payment records table
 CREATE TABLE payments (
     id INT PRIMARY KEY AUTO_INCREMENT,
-    loan_application_id INT NOT NULL,
-    user_id INT NOT NULL,
+    loan_application_id INT,
+    user_id INT,
+    payer_name VARCHAR(255),
+    payer_email VARCHAR(255),
     amount DECIMAL(15,2) NOT NULL,
-    payment_type ENUM('loan_repayment', 'processing_fee', 'late_fee', 'early_repayment') NOT NULL,
+    payment_type ENUM('loan_repayment', 'processing_fee', 'late_fee', 'early_repayment', 'other') NOT NULL,
     payment_method ENUM('bank_transfer', 'card', 'cash', 'automatic_debit') NOT NULL,
     stripe_payment_intent_id VARCHAR(255),
     transaction_reference VARCHAR(255),
@@ -153,8 +155,8 @@ SELECT
     la.loan_type,
     la.amount_requested as loan_amount
 FROM payments p
-JOIN users u ON p.user_id = u.id
-JOIN loan_applications la ON p.loan_application_id = la.id;
+LEFT JOIN users u ON p.user_id = u.id
+LEFT JOIN loan_applications la ON p.loan_application_id = la.id;
 
 
 

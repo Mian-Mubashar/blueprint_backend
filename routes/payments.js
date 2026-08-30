@@ -7,8 +7,10 @@ const sendEmail = require('../utils/email');
 
 const router = express.Router();
 
-// Public quick payment intent (no auth, no DB record)
-router.post('/public/create-payment-intent', [
+const ALLOWED_PUBLIC_PAYMENT_TYPES = ['loan_repayment', 'processing_fee', 'late_fee', 'early_repayment', 'other'];
+
+// Public payment intent — saves a DB record so admin/user can see who paid and for which loan
+router.post('/public/create-payment-intent', auth.optionalAuth, [
   body('amount').isFloat({ min: 100, max: 10000000 }).withMessage('Amount must be between ₦100 and ₦10,000,000')
 ], async (req, res) => {
   try {
@@ -30,7 +32,7 @@ router.post('/public/create-payment-intent', [
       });
     }
 
-    const { amount } = req.body;
+    const { amount, loanApplicationId, paymentType, payerName, payerEmail } = req.body;
     const numericAmount = parseFloat(amount);
 
     if (isNaN(numericAmount) || numericAmount < 100 || numericAmount > 10000000) {
@@ -40,31 +42,68 @@ router.post('/public/create-payment-intent', [
       });
     }
 
-    console.log('Creating payment intent for amount:', numericAmount);
+    const userId = req.user?.userId || null;
+    let parsedLoanId = loanApplicationId ? parseInt(loanApplicationId, 10) : null;
+    if (parsedLoanId && (isNaN(parsedLoanId) || parsedLoanId <= 0)) {
+      parsedLoanId = null;
+    }
 
-    // Create payment intent with NGN currency
-    // Note: If Stripe account doesn't support NGN, you may need to use USD or enable NGN in Stripe dashboard
+    let resolvedPaymentType = ALLOWED_PUBLIC_PAYMENT_TYPES.includes(paymentType)
+      ? paymentType
+      : (parsedLoanId ? 'loan_repayment' : 'other');
+
+    if (parsedLoanId) {
+      let loanQuery = 'SELECT id, user_id, loan_type, status FROM loan_applications WHERE id = ?';
+      const loanParams = [parsedLoanId];
+      if (userId) {
+        loanQuery += ' AND user_id = ?';
+        loanParams.push(userId);
+      }
+      const [loans] = await pool.execute(loanQuery, loanParams);
+      if (loans.length === 0) {
+        return res.status(404).json({
+          message: 'Loan application not found. Please select a valid loan.'
+        });
+      }
+      resolvedPaymentType = resolvedPaymentType === 'other' ? 'loan_repayment' : resolvedPaymentType;
+    } else if (userId) {
+      parsedLoanId = null;
+      resolvedPaymentType = 'other';
+    }
+
+    console.log('Creating public payment intent:', {
+      amount: numericAmount,
+      userId,
+      loanApplicationId: parsedLoanId,
+      paymentType: resolvedPaymentType
+    });
+
+    const stripeMetadata = {
+      source: 'public_payment',
+      amount: numericAmount.toString(),
+      paymentType: resolvedPaymentType
+    };
+    if (userId) stripeMetadata.userId = userId.toString();
+    if (parsedLoanId) stripeMetadata.loanApplicationId = parsedLoanId.toString();
+
     let paymentIntent;
     try {
       paymentIntent = await stripe.paymentIntents.create({
-        amount: Math.round(numericAmount * 100), // Convert to kobo (smallest NGN unit)
+        amount: Math.round(numericAmount * 100),
         currency: 'ngn',
-        metadata: {
-          source: 'public_payment',
-          amount: numericAmount.toString()
-        },
-        description: `Public payment of ₦${numericAmount.toLocaleString()}`
+        metadata: stripeMetadata,
+        description: parsedLoanId
+          ? `Loan repayment for application #${parsedLoanId} - ₦${numericAmount.toLocaleString()}`
+          : `Public payment of ₦${numericAmount.toLocaleString()}`
       });
     } catch (stripeError) {
-      // If NGN is not supported, try with USD (for testing)
       if (stripeError.code === 'currency_not_supported' || stripeError.message?.includes('currency')) {
         console.warn('NGN not supported, trying USD for testing');
         paymentIntent = await stripe.paymentIntents.create({
-          amount: Math.round(numericAmount * 100), // For USD, this is cents
+          amount: Math.round(numericAmount * 100),
           currency: 'usd',
           metadata: {
-            source: 'public_payment',
-            amount: numericAmount.toString(),
+            ...stripeMetadata,
             original_currency: 'NGN'
           },
           description: `Public payment of ₦${numericAmount.toLocaleString()}`
@@ -74,11 +113,30 @@ router.post('/public/create-payment-intent', [
       }
     }
 
-    console.log('Payment intent created:', paymentIntent.id);
+    const [result] = await pool.execute(
+      `INSERT INTO payments (
+        loan_application_id, user_id, payer_name, payer_email, amount, payment_type,
+        payment_method, stripe_payment_intent_id, status
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        parsedLoanId,
+        userId,
+        userId ? null : (payerName || '').trim() || null,
+        userId ? null : (payerEmail || '').trim() || null,
+        numericAmount,
+        resolvedPaymentType,
+        'card',
+        paymentIntent.id,
+        'pending'
+      ]
+    );
+
+    console.log('Payment intent created:', paymentIntent.id, 'DB payment id:', result.insertId);
 
     res.json({
       clientSecret: paymentIntent.client_secret,
-      paymentIntentId: paymentIntent.id
+      paymentIntentId: paymentIntent.id,
+      paymentId: result.insertId
     });
   } catch (error) {
     console.error('Public create payment intent error:', error);
@@ -102,6 +160,89 @@ router.post('/public/create-payment-intent', [
     res.status(500).json({
       message: errorMessage,
       error: error.message || 'Unknown error'
+    });
+  }
+});
+
+// Confirm public payment after Stripe succeeds
+router.post('/public/confirm-payment', [
+  body('paymentId').isInt(),
+  body('paymentIntentId').notEmpty()
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        message: 'Validation failed',
+        errors: errors.array()
+      });
+    }
+
+    const { paymentId, paymentIntentId } = req.body;
+
+    const [payments] = await pool.execute(
+      'SELECT * FROM payments WHERE id = ? AND stripe_payment_intent_id = ?',
+      [paymentId, paymentIntentId]
+    );
+
+    if (payments.length === 0) {
+      return res.status(404).json({ message: 'Payment not found' });
+    }
+
+    const payment = payments[0];
+    const paymentIntent = await stripe.paymentIntents.retrieve(paymentIntentId);
+
+    if (paymentIntent.status === 'succeeded') {
+      await pool.execute(
+        'UPDATE payments SET status = ?, transaction_reference = ? WHERE id = ?',
+        ['completed', paymentIntentId, paymentId]
+      );
+
+      if (payment.user_id) {
+        const [users] = await pool.execute(
+          'SELECT email, first_name, last_name FROM users WHERE id = ?',
+          [payment.user_id]
+        );
+        if (users.length > 0) {
+          try {
+            await sendEmail({
+              to: users[0].email,
+              subject: 'Payment Confirmation - Blue Print Financial',
+              template: 'payment-confirmation',
+              data: {
+                name: `${users[0].first_name} ${users[0].last_name}`,
+                amount: payment.amount,
+                paymentType: payment.payment_type,
+                transactionId: paymentIntentId,
+                date: new Date().toLocaleDateString('en-NG')
+              }
+            });
+          } catch (emailError) {
+            console.error('Payment confirmation email failed:', emailError.message);
+          }
+        }
+      }
+
+      return res.json({
+        message: 'Payment confirmed successfully',
+        status: 'completed'
+      });
+    }
+
+    await pool.execute(
+      'UPDATE payments SET status = ? WHERE id = ?',
+      ['failed', paymentId]
+    );
+
+    return res.status(400).json({
+      message: 'Payment not completed',
+      status: paymentIntent.status
+    });
+  } catch (error) {
+    console.error('Public confirm payment error:', error);
+    res.status(500).json({
+      message: 'Failed to confirm payment',
+      error: error.message
     });
   }
 });
@@ -489,7 +630,7 @@ router.get('/history', auth, async (req, res) => {
         p.status, p.payment_date, p.transaction_reference,
         la.loan_type, la.amount_requested
       FROM payments p
-      JOIN loan_applications la ON p.loan_application_id = la.id
+      LEFT JOIN loan_applications la ON p.loan_application_id = la.id
       WHERE p.user_id = ?
       ORDER BY p.payment_date DESC`,
       [req.user.userId]
@@ -517,7 +658,7 @@ router.get('/:id', auth, async (req, res) => {
       `SELECT 
         p.*, la.loan_type, la.amount_requested
       FROM payments p
-      JOIN loan_applications la ON p.loan_application_id = la.id
+      LEFT JOIN loan_applications la ON p.loan_application_id = la.id
       WHERE p.id = ? AND p.user_id = ?`,
       [id, req.user.userId]
     );
@@ -570,12 +711,12 @@ router.post('/webhook', express.raw({ type: 'application/json' }), async (req, r
         const [payments] = await pool.execute(
           `SELECT p.*, u.email, u.first_name, u.last_name 
            FROM payments p 
-           JOIN users u ON p.user_id = u.id 
+           LEFT JOIN users u ON p.user_id = u.id 
            WHERE p.stripe_payment_intent_id = ?`,
           [paymentIntent.id]
         );
 
-        if (payments.length > 0) {
+        if (payments.length > 0 && payments[0].email) {
           const payment = payments[0];
           // Send admin notification (use ADMIN_EMAIL from env or fallback)
           const adminEmail = process.env.ADMIN_EMAIL || 'mubasharhanif24@gmail.com';

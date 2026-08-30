@@ -52,6 +52,38 @@ const auth = async (req, res, next) => {
   }
 };
 
+const optionalAuth = async (req, res, next) => {
+  try {
+    const token = req.header('Authorization')?.replace('Bearer ', '');
+    if (!token) {
+      req.user = null;
+      return next();
+    }
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const [users] = await pool.execute(
+      'SELECT id, email, first_name, last_name, role FROM users WHERE id = ?',
+      [decoded.userId]
+    );
+
+    if (users.length === 0) {
+      req.user = null;
+      return next();
+    }
+
+    req.user = {
+      userId: decoded.userId,
+      email: decoded.email,
+      role: users[0].role
+    };
+    next();
+  } catch (error) {
+    req.user = null;
+    next();
+  }
+};
+
+auth.optionalAuth = optionalAuth;
 module.exports = auth;
 
 

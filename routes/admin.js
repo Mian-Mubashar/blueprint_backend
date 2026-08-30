@@ -242,6 +242,8 @@ router.get('/payments', async (req, res) => {
         p.due_date,
         p.transaction_reference,
         p.stripe_payment_intent_id,
+        p.payer_name,
+        p.payer_email,
         p.created_at,
         u.first_name,
         u.last_name,
@@ -251,7 +253,7 @@ router.get('/payments', async (req, res) => {
         la.amount_requested as loan_amount,
         la.status as loan_status
       FROM payments p
-      JOIN users u ON p.user_id = u.id
+      LEFT JOIN users u ON p.user_id = u.id
       LEFT JOIN loan_applications la ON p.loan_application_id = la.id
       WHERE 1=1
     `;
@@ -269,11 +271,13 @@ router.get('/payments', async (req, res) => {
         u.last_name LIKE ? OR 
         u.email LIKE ? OR 
         u.phone LIKE ? OR
+        p.payer_name LIKE ? OR
+        p.payer_email LIKE ? OR
         p.transaction_reference LIKE ? OR
         p.stripe_payment_intent_id LIKE ?
       )`;
       const searchTerm = `%${search}%`;
-      params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
+      params.push(searchTerm, searchTerm, searchTerm, searchTerm, searchTerm, searchTerm, searchTerm, searchTerm);
     }
     
     if (startDate) {
@@ -326,7 +330,7 @@ router.get('/payments/:id', async (req, res) => {
         la.amount_requested as loan_amount,
         la.status as loan_status
       FROM payments p
-      JOIN users u ON p.user_id = u.id
+      LEFT JOIN users u ON p.user_id = u.id
       LEFT JOIN loan_applications la ON p.loan_application_id = la.id
       WHERE p.id = ?
     `, [id]);

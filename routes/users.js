@@ -51,7 +51,7 @@ router.get('/dashboard', auth, async (req, res) => {
         p.id, p.amount, p.payment_type, p.status, p.payment_date,
         la.loan_type
       FROM payments p
-      JOIN loan_applications la ON p.loan_application_id = la.id
+      LEFT JOIN loan_applications la ON p.loan_application_id = la.id
       WHERE p.user_id = ?
       ORDER BY p.payment_date DESC 
       LIMIT 5`,
@@ -150,7 +150,7 @@ router.get('/payments', auth, async (req, res) => {
         p.status, p.payment_date, p.transaction_reference,
         la.loan_type, la.amount_requested
       FROM payments p
-      JOIN loan_applications la ON p.loan_application_id = la.id
+      LEFT JOIN loan_applications la ON p.loan_application_id = la.id
       WHERE p.user_id = ?
       ORDER BY p.payment_date DESC`,
       [req.user.userId]

@@ -1,5 +1,5 @@
 const fs = require('fs');
-require('dotenv').config();
+require('dotenv').config({ override: true });
 
 const SOCKET_CANDIDATES = [
   process.env.DB_SOCKET,
