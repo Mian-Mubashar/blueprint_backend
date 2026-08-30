@@ -3,7 +3,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
-require('dotenv').config({ override: true });
+require('./config/loadEnv').loadEnv();
 
 const authRoutes = require('./routes/auth');
 const loanRoutes = require('./routes/loans');

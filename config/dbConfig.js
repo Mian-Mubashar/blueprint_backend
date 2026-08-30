@@ -1,5 +1,7 @@
 const fs = require('fs');
-require('dotenv').config({ override: true });
+const { loadEnv } = require('./loadEnv');
+
+const loadedEnvFiles = loadEnv();
 
 const SOCKET_CANDIDATES = [
   process.env.DB_SOCKET,
@@ -38,4 +40,13 @@ function getDbConfig(extra = {}) {
   return config;
 }
 
-module.exports = { getDbConfig };
+function describeDbTarget() {
+  return {
+    user: process.env.DB_USER || 'root',
+    database: process.env.DB_NAME || 'blueprint',
+    host: process.env.DB_HOST || 'localhost',
+    envFiles: loadedEnvFiles.length ? loadedEnvFiles.join(', ') : 'none (using defaults)',
+  };
+}
+
+module.exports = { getDbConfig, describeDbTarget };

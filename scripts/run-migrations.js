@@ -1,7 +1,7 @@
 const mysql = require('mysql2/promise');
 const fs = require('fs').promises;
 const path = require('path');
-const { getDbConfig } = require('../config/dbConfig');
+const { getDbConfig, describeDbTarget } = require('../config/dbConfig');
 
 const dbConfig = getDbConfig({ multipleStatements: true });
 
@@ -78,6 +78,14 @@ async function main() {
 
     // Create connection
     console.log('Connecting to database...');
+    const target = describeDbTarget();
+    console.log(`Env file(s): ${target.envFiles}`);
+    console.log(`DB user: ${target.user}  database: ${target.database}  host: ${target.host}`);
+    if (target.envFiles === 'none (using defaults)' || target.user === 'root') {
+      console.warn('No production .env found. On Hostinger create ~/blueprint.env then rerun migrate.');
+      console.warn('  nano ~/blueprint.env');
+      console.warn('  cp ~/blueprint.env ~/domains/api.blueprintmicrofinance.com/hbuilds/current/nodejs/.env');
+    }
     connection = await mysql.createConnection(dbConfig);
     console.log('✅ Connected to database');
     console.log('');
@@ -130,8 +138,11 @@ async function main() {
   } catch (error) {
     console.error('❌ Migration failed:', error.message);
     if (error.code === 'ER_ACCESS_DENIED_ERROR') {
-      console.error('   Database access denied. Please check your .env file:');
-      console.error('   DB_HOST, DB_USER, DB_PASSWORD, DB_NAME');
+      console.error('   Database access denied. Hostinger SSH does not use hPanel env vars.');
+      console.error('   Create a file that survives deploys:');
+      console.error('     nano ~/blueprint.env');
+      console.error('   Put DB_HOST, DB_USER, DB_PASSWORD, DB_NAME from hPanel → MySQL.');
+      console.error('   Then: cp ~/blueprint.env .env && npm run migrate');
     } else if (error.code === 'ER_BAD_DB_ERROR') {
       console.error('   Database not found. Please create the database first.');
     }
