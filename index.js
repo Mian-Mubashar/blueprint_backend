@@ -17,13 +17,17 @@ const PORT = process.env.PORT || 5000;
 
 app.set('trust proxy', 1);
 
-app.use(helmet());
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  crossOriginEmbedderPolicy: false,
+}));
 
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
   message: 'Too many requests from this IP, please try again later.',
-  validate: { xForwardedForHeader: false }
+  validate: { xForwardedForHeader: false },
+  skip: (req) => req.method === 'OPTIONS'
 });
 app.use(limiter);
 
@@ -32,18 +36,44 @@ const allowedOrigins = [
   'http://127.0.0.1:3000',
   'https://blueprintmicrofinance.com',
   'https://www.blueprintmicrofinance.com',
-  ...(process.env.CLIENT_URL || '').split(',').map((origin) => origin.trim()).filter(Boolean)
-].filter((origin, index, list) => list.indexOf(origin) === index);
+  'http://blueprintmicrofinance.com',
+  'http://www.blueprintmicrofinance.com',
+  ...(process.env.CLIENT_URL || '').split(',').map((origin) => origin.trim()).filter(Boolean),
+  ...(process.env.FRONTEND_URL || '').split(',').map((origin) => origin.trim()).filter(Boolean)
+].map((origin) => origin.replace(/\/$/, ''))
+  .filter((origin, index, list) => origin && list.indexOf(origin) === index);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true;
+  return allowedOrigins.includes(origin.replace(/\/$/, ''));
+}
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isAllowedOrigin(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+    res.header('Vary', 'Origin');
+  }
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes(origin)) {
+    if (isAllowedOrigin(origin)) {
       return callback(null, true);
     }
     console.warn('Blocked CORS origin:', origin);
     return callback(null, false);
   },
-  credentials: true
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
 // Body parsing middleware
